@@ -155,4 +155,4 @@ Open the local URL displayed in the terminal to access FootyGPT.
 
 
 
-**Built with Python and a passion for football. ⚽**
+**Built with Python and a passion for Football.**
