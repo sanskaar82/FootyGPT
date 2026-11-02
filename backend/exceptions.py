@@ -58,6 +58,17 @@ class AIProviderError(AIServiceError):
     status_code = 502
     message = "The AI service returned an error. Please try again."
 
+    def __init__(self, retryable: bool = False):
+        """Initialize with retryable flag.
+
+        Args:
+            retryable: Whether this error is temporary and safe to retry
+                with a fallback provider. HTTP 5xx errors are retryable;
+                malformed/empty responses are not.
+        """
+        super().__init__()
+        self.retryable = retryable
+
 
 def _ai_error_response(request: Request, error: AIServiceError) -> JSONResponse:
     """Log the error type (never the key or message content) and reply."""

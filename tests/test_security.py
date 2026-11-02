@@ -12,13 +12,19 @@ from sqlalchemy.orm import Session
 from backend.config import Settings
 from backend.database import get_db
 from backend.exceptions import (
+    AIConfigError,
     AIProviderError,
+    AIServiceError,
+    AIRateLimitError,
+    AITimeoutError,
     DATABASE_ERROR_MESSAGE,
     GENERIC_ERROR_MESSAGE,
 )
 from backend.main import app
 from backend.models import Message
 from backend.services.ai_service import MAX_ANSWER_CHARS, AIService, get_ai_service
+from backend.services.providers.gemini import GeminiProvider
+from backend.services.providers.openrouter import OpenRouterProvider
 
 SECRET = "sk-or-v1-this-is-a-fake-secret-used-only-in-tests"
 
@@ -318,3 +324,428 @@ def test_out_of_range_ai_settings_are_rejected(field: str, value: object) -> Non
     """Silly values in .env fail at startup instead of causing runaway costs."""
     with pytest.raises(ValueError):
         Settings(_env_file=None, **{field: value})
+
+
+# --- Provider configuration ---------------------------------------------------
+
+
+def test_ai_provider_defaults_to_openrouter() -> None:
+    """The default AI provider is OpenRouter for backward compatibility."""
+    config = Settings(_env_file=None)
+
+    assert config.ai_provider == "openrouter"
+
+
+def test_ai_provider_accepts_gemini() -> None:
+    """Gemini is a supported AI provider."""
+    config = Settings(_env_file=None, ai_provider="gemini")
+
+    assert config.ai_provider == "gemini"
+
+
+def test_ai_provider_rejects_unknown_provider() -> None:
+    """An unsupported AI provider is rejected at startup."""
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_provider="anthropic")
+
+
+def test_blank_gemini_key_is_treated_as_missing() -> None:
+    """An empty GEMINI_API_KEY does not count as configured."""
+    config = Settings(
+        _env_file=None, ai_provider="gemini", gemini_api_key="   ", gemini_model="m"
+    )
+
+    assert config.gemini_api_key is None
+    assert config.ai_configured is False
+
+
+def test_gemini_configured_when_key_and_model_set() -> None:
+    """ai_configured is True for Gemini when both key and model are set."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="gemini",
+        gemini_api_key="key",
+        gemini_model="gemini-1.5-flash",
+    )
+
+    assert config.ai_configured is True
+
+
+def test_openrouter_configured_still_works_by_default() -> None:
+    """ai_configured remains True for OpenRouter when both key and model are set."""
+    config = Settings(_env_file=None, openrouter_api_key="key", openrouter_model="m")
+
+    assert config.ai_provider == "openrouter"
+    assert config.ai_configured is True
+
+
+def test_gemini_not_configured_when_key_missing() -> None:
+    """ai_configured is False for Gemini when the key is missing."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="gemini",
+        gemini_model="m",
+        gemini_api_key=None,
+        langsmith_tracing=False,
+        langsmith_api_key=None,
+    )
+
+    assert config.ai_configured is False
+
+
+def test_gemini_not_configured_when_model_missing() -> None:
+    """ai_configured is False for Gemini when the model is missing."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="gemini",
+        gemini_api_key="key",
+        gemini_model=None,
+        langsmith_tracing=False,
+        langsmith_api_key=None,
+    )
+
+    assert config.ai_configured is False
+
+
+def test_provider_configured_reports_per_provider() -> None:
+    """provider_configured reports readiness for each provider independently."""
+    config = Settings(
+        _env_file=None,
+        openrouter_api_key="or-key",
+        openrouter_model="or-model",
+        gemini_api_key="gem-key",
+        gemini_model="gem-model",
+    )
+
+    assert config.provider_configured("openrouter") is True
+    assert config.provider_configured("gemini") is True
+
+
+def test_gemini_api_key_never_appears_in_repr() -> None:
+    """The settings object does not print the Gemini API key."""
+    config = Settings(_env_file=None, ai_provider="gemini", gemini_api_key="secret-key")
+
+    assert "secret-key" not in repr(config)
+    assert "secret-key" not in str(config)
+    assert config.gemini_api_key_value == "secret-key"
+
+
+def test_gemini_base_url_must_be_http() -> None:
+    """A Gemini base URL that would send the key elsewhere is refused at startup."""
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_provider="gemini", gemini_base_url="ftp://evil.example")
+
+
+def test_gemini_base_url_trailing_slash_is_normalised() -> None:
+    """A trailing slash on the Gemini base URL is removed."""
+    config = Settings(
+        _env_file=None, ai_provider="gemini", gemini_base_url="https://example.test/api/"
+    )
+
+    assert config.gemini_base_url == "https://example.test/api"
+
+
+# --- Provider selection -------------------------------------------------------
+
+
+def test_ai_service_defaults_to_openrouter_provider() -> None:
+    """Without AI_PROVIDER, AIService uses OpenRouterProvider."""
+    service = AIService(
+        Settings(_env_file=None, openrouter_api_key="key", openrouter_model="m")
+    )
+
+    assert isinstance(service.provider, OpenRouterProvider)
+    assert service.provider.model == "m"
+
+
+def test_ai_service_explicit_openrouter_provider() -> None:
+    """AI_PROVIDER=openrouter selects OpenRouterProvider."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="openrouter",
+            openrouter_api_key="key",
+            openrouter_model="m",
+        )
+    )
+
+    assert isinstance(service.provider, OpenRouterProvider)
+
+
+def test_ai_service_gemini_selects_gemini_provider() -> None:
+    """AI_PROVIDER=gemini selects GeminiProvider."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="gemini",
+            gemini_api_key="key",
+            gemini_model="gemini-1.5-flash",
+        )
+    )
+
+    from backend.services.providers.gemini import GeminiProvider
+
+    assert isinstance(service.provider, GeminiProvider)
+    assert service.provider.model == "gemini-1.5-flash"
+
+
+def test_ai_service_missing_gemini_key_raises_config_error() -> None:
+    """Missing Gemini API key raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="gemini",
+            gemini_model="gemini-1.5-flash",
+            gemini_api_key=None,
+            langsmith_tracing=False,
+            langsmith_api_key=None,
+        )
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_ai_service_missing_gemini_model_raises_config_error() -> None:
+    """Missing Gemini model raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="gemini",
+            gemini_api_key="key",
+            gemini_model=None,
+            langsmith_tracing=False,
+            langsmith_api_key=None,
+        )
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_ai_service_missing_openrouter_key_raises_config_error() -> None:
+    """Missing OpenRouter API key raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="openrouter",
+            openrouter_model="m",
+            openrouter_api_key=None,
+            langsmith_tracing=False,
+            langsmith_api_key=None,
+        )
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_ai_service_missing_openrouter_model_raises_config_error() -> None:
+    """Missing OpenRouter model raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(_env_file=None, ai_provider="openrouter", openrouter_api_key="key")
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_ai_service_unsupported_provider_raises_config_error() -> None:
+    """An unsupported AI provider is rejected at Settings validation."""
+    with pytest.raises(ValueError):
+        Settings(
+            _env_file=None,
+            ai_provider="anthropic",
+            openrouter_api_key="key",
+            openrouter_model="m",
+        )
+
+
+def test_ai_service_provider_selection_does_not_expose_key() -> None:
+    """Provider selection constructs GeminiProvider without exposing the key."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="gemini",
+            gemini_api_key="secret-key",
+            gemini_model="gemini-1.5-flash",
+        )
+    )
+
+    assert isinstance(service.provider, GeminiProvider)
+    assert "secret-key" not in repr(service.provider)
+
+
+# --- Free-tier model configuration --------------------------------------------
+
+
+def test_openrouter_free_model_identifier_is_accepted() -> None:
+    """OpenRouter supports the openrouter/free model identifier."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="openrouter",
+        openrouter_api_key="key",
+        openrouter_model="openrouter/free",
+    )
+
+    assert config.openrouter_model == "openrouter/free"
+    assert config.ai_configured is True
+
+
+def test_openrouter_free_model_with_suffix_is_accepted() -> None:
+    """OpenRouter supports model identifiers with :free suffix."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="openrouter",
+        openrouter_api_key="key",
+        openrouter_model="meta-llama/llama-3.1-8b-instruct:free",
+    )
+
+    assert config.openrouter_model == "meta-llama/llama-3.1-8b-instruct:free"
+    assert config.ai_configured is True
+
+
+def test_gemini_free_model_identifier_is_accepted() -> None:
+    """Gemini supports configurable free-tier model identifiers."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="gemini",
+        gemini_api_key="key",
+        gemini_model="gemini-1.5-flash",
+    )
+
+    assert config.gemini_model == "gemini-1.5-flash"
+    assert config.ai_configured is True
+
+
+def test_provider_switching_gemini_to_openrouter() -> None:
+    """Switching from Gemini to OpenRouter uses OpenRouter settings."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="openrouter",
+        openrouter_api_key="or-key",
+        openrouter_model="openrouter/free",
+        gemini_api_key="gem-key",
+        gemini_model="gemini-1.5-flash",
+    )
+
+    assert config.ai_provider == "openrouter"
+    assert config.ai_configured is True
+    assert config.provider_configured("openrouter") is True
+    assert config.provider_configured("gemini") is True
+
+
+def test_provider_switching_openrouter_to_gemini() -> None:
+    """Switching from OpenRouter to Gemini uses Gemini settings."""
+    config = Settings(
+        _env_file=None,
+        ai_provider="gemini",
+        openrouter_api_key="or-key",
+        openrouter_model="openrouter/free",
+        gemini_api_key="gem-key",
+        gemini_model="gemini-1.5-flash",
+    )
+
+    assert config.ai_provider == "gemini"
+    assert config.ai_configured is True
+    assert config.provider_configured("gemini") is True
+
+
+def test_missing_openrouter_model_raises_config_error_in_service() -> None:
+    """Missing OpenRouter model raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(_env_file=None, ai_provider="openrouter", openrouter_api_key="key")
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_missing_gemini_model_raises_config_error_in_service() -> None:
+    """Missing Gemini model raises AIConfigError before any HTTP call."""
+    service = AIService(
+        Settings(
+            _env_file=None,
+            ai_provider="gemini",
+            gemini_api_key="key",
+            gemini_model=None,
+            langsmith_tracing=False,
+            langsmith_api_key=None,
+        )
+    )
+
+    with pytest.raises(AIConfigError):
+        asyncio.run(service.complete([{"role": "user", "content": "hi"}]))
+
+
+def test_token_configuration_is_shared_across_providers() -> None:
+    """AI_MAX_TOKENS, AI_TEMPERATURE, AI_MAX_HISTORY_MESSAGES work for both providers."""
+    config = Settings(
+        _env_file=None,
+        ai_timeout_seconds=15.0,
+        ai_max_history_messages=5,
+        ai_max_tokens=400,
+        ai_temperature=0.7,
+    )
+
+    assert config.ai_timeout_seconds == 15.0
+    assert config.ai_max_history_messages == 5
+    assert config.ai_max_tokens == 400
+    assert config.ai_temperature == 0.7
+
+
+def test_out_of_range_token_settings_are_rejected() -> None:
+    """Invalid token configuration values fail at startup."""
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_max_tokens=0)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_max_tokens=5000)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_temperature=5)
+
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, ai_max_history_messages=-1)
+
+
+# --- Retryable exception classification ---------------------------------------
+
+
+def test_ai_provider_error_default_not_retryable() -> None:
+    """AIProviderError defaults to retryable=False."""
+    error = AIProviderError()
+    assert error.retryable is False
+
+
+def test_ai_provider_error_retryable_true() -> None:
+    """AIProviderError can be constructed with retryable=True."""
+    error = AIProviderError(retryable=True)
+    assert error.retryable is True
+
+
+def test_ai_provider_error_retryable_false_explicit() -> None:
+    """AIProviderError(retryable=False) is explicitly non-retryable."""
+    error = AIProviderError(retryable=False)
+    assert error.retryable is False
+
+
+def test_ai_config_error_not_retryable() -> None:
+    """AIConfigError is never retryable (no fallback for config errors)."""
+    error = AIConfigError()
+    assert not hasattr(error, "retryable") or error.retryable is False
+    assert isinstance(error, AIServiceError)
+
+
+def test_ai_timeout_error_eligible_for_fallback() -> None:
+    """AITimeoutError is a distinct exception type eligible for fallback."""
+    error = AITimeoutError()
+    assert isinstance(error, AIServiceError)
+    assert error.status_code == 504
+
+
+def test_ai_rate_limit_error_eligible_for_fallback() -> None:
+    """AIRateLimitError is a distinct exception type eligible for fallback."""
+    error = AIRateLimitError()
+    assert isinstance(error, AIServiceError)
+    assert error.status_code == 429

@@ -126,6 +126,158 @@ Add your own OpenRouter API key and configure the AI model according to the vari
 
 **Security note:** Never commit your `.env` file or publish your API key. Keep your credentials private.
 
+### LangSmith Observability (optional)
+
+FootyGPT integrates with [LangSmith](https://smith.langchain.com) for LLM observability.
+Tracing is **disabled by default** and the backend works normally without any
+LangSmith credentials.
+
+To enable tracing:
+
+1. Create a LangSmith account at https://smith.langchain.com and obtain an API key.
+2. Add the following to your `.env` file:
+
+   ```
+   LANGSMITH_TRACING=true
+   LANGSMITH_API_KEY=your-langsmith-api-key-here
+   LANGSMITH_PROJECT=FootyGPT
+   ```
+
+3. Restart the backend. Each AI request will be traced with provider, model,
+   input messages, response, latency, success/failure status, and token usage
+   (when reported by the provider).
+
+No API keys or authorization headers are ever captured in traces.
+
+### Free-Tier Model Configuration
+
+FootyGPT supports free-tier AI models from both OpenRouter and Google Gemini.
+Free tiers have rate limits and token quotas; they are not unlimited.
+
+#### Google Gemini
+
+1. Obtain a Gemini API key at https://aistudio.google.com/app/apikey.
+2. Select a free-tier model. Verify current free models and rate limits at
+   https://ai.google.dev/pricing before selecting one.
+3. Configure your `.env`:
+
+   ```
+   AI_PROVIDER=gemini
+   GEMINI_API_KEY=your-gemini-api-key-here
+   GEMINI_MODEL=gemini-1.5-flash
+   ```
+
+`gemini-1.5-flash` is an example free-tier model; model availability changes
+over time. Always check Google's official documentation before deploying.
+
+#### OpenRouter
+
+1. Obtain an OpenRouter API key at https://openrouter.ai/keys.
+2. Select a model. OpenRouter free models use the `:free` suffix, e.g.
+   `openrouter/free` or `meta-llama/llama-3.1-8b-instruct:free`. Verify
+   current free models at https://openrouter.ai/models.
+3. Configure your `.env`:
+
+   ```
+   AI_PROVIDER=openrouter
+   OPENROUTER_API_KEY=your-openrouter-api-key-here
+   OPENROUTER_MODEL=openrouter/free
+   ```
+
+#### Switching Providers
+
+Set `AI_PROVIDER` to `openrouter` or `gemini` in your `.env`. Only the
+selected provider's API key and model are required; the other provider's
+settings are ignored.
+
+#### Automatic Provider Fallback
+
+FootyGPT can automatically fall back to a secondary AI provider when the
+primary provider encounters a temporary failure (rate limit, timeout, or
+server error). Fallback is **disabled by default** and must be explicitly
+configured.
+
+**How it works:**
+
+1. The primary provider is selected by `AI_PROVIDER`.
+2. Optionally, set `AI_FALLBACK_PROVIDER` to the secondary provider.
+3. If the primary raises a retryable error, the fallback provider is
+   attempted **once**.
+4. If the fallback also fails, the original primary exception is raised.
+5. If fallback is not configured, or the fallback provider lacks valid
+   credentials, the primary exception is raised immediately.
+
+**Fallback is triggered for:**
+- `AIRateLimitError` (HTTP 429)
+- `AITimeoutError` (request timeout)
+- `AIProviderError` with retryable server errors (HTTP 5xx)
+
+**Fallback is NOT triggered for:**
+- `AIConfigError` (missing or invalid API key, missing model)
+- Non-retryable provider errors (malformed responses, empty responses,
+  safety-blocked responses)
+
+**Configuration examples:**
+
+Gemini primary with OpenRouter fallback:
+```
+AI_PROVIDER=gemini
+AI_FALLBACK_PROVIDER=openrouter
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_MODEL=gemini-1.5-flash
+OPENROUTER_API_KEY=your-openrouter-api-key-here
+OPENROUTER_MODEL=openrouter/free
+```
+
+OpenRouter primary with Gemini fallback:
+```
+AI_PROVIDER=openrouter
+AI_FALLBACK_PROVIDER=gemini
+OPENROUTER_API_KEY=your-openrouter-api-key-here
+OPENROUTER_MODEL=openrouter/free
+GEMINI_API_KEY=your-gemini-api-key-here
+GEMINI_MODEL=gemini-1.5-flash
+```
+
+Disable fallback:
+```
+AI_PROVIDER=gemini
+AI_FALLBACK_PROVIDER=
+```
+
+**Cost warning:** Fallback requests can incur additional charges depending
+on the selected model and provider. Fallback is permitted only when
+explicitly configured; it never silently switches to a paid model.
+
+#### Managing Free-Tier Usage
+
+To reduce token consumption and stay within free-tier limits:
+
+- **`AI_MAX_TOKENS`** — caps the maximum output tokens per response (default: 800).
+- **`AI_MAX_HISTORY_MESSAGES`** — limits how many previous messages are sent
+  as context (default: 10).
+- **`AI_TEMPERATURE`** — lower values produce more deterministic, shorter
+  responses (default: 0.3).
+
+Reducing `AI_MAX_HISTORY_MESSAGES` and `AI_MAX_TOKENS` is the most effective
+way to manage free-tier token usage.
+
+#### Rate Limits and Errors
+
+When a provider returns HTTP 429 (rate limit), FootyGPT returns a
+`429 Too Many Requests` response with a friendly message. If automatic
+fallback is configured (`AI_FALLBACK_PROVIDER`), a rate limit from the
+primary provider triggers a fallback attempt instead. Otherwise, wait
+briefly and try again.
+
+Avoiding unexpected charges:
+
+- Verify that your selected model is actually free-tier before configuring it.
+- Paid models can incur charges even on free accounts if you exceed quotas.
+- Monitor your provider's dashboard for usage and billing.
+- Enabling fallback may result in charges from both providers for a single
+  request if the primary is rate-limited.
+
 ### 7. Start the Backend
 
 Run the following command in your first terminal:

@@ -6,4 +6,5 @@ pydantic
 pydantic-settings
 httpx
 python-dotenv
+langsmith
 pytest
